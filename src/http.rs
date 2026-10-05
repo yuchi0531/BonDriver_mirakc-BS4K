@@ -4,25 +4,32 @@
 //! レスポンス全体を読み切ってボディだけを取り出す用途に使う。
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-/// `http://host:port{path}` に GET し、レスポンスボディを返す。
-/// 失敗した場合は None。
-pub fn get_body(host: &str, port: u16, path: &str) -> Option<String> {
-    // 接続タイムアウトを設けて、到達不能ホストでの長時間ブロックを防ぐ。
-    let addr = (host, port).to_socket_addrs().ok()?.next()?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
-
+/// 確立済みのストリーム(Unix ソケット等)に対して GET し、ボディを返す。
+/// `host` は Host ヘッダ用(Unix ソケットでも mirakc は Host を要求する)。
+///
+/// BonDriver_mirakc と同様、チャンネル一覧取得にも `X-Mirakurun-Priority` を送る。
+pub fn get_via(
+    stream: &mut crate::transport::Stream,
+    host: &str,
+    path: &str,
+    priority: i32,
+) -> Option<String> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)));
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {ua}\r\nX-Mirakurun-Priority: {priority}\r\nConnection: close\r\n\r\n",
         path = path,
         host = host,
+        ua = crate::util::USER_AGENT,
     );
     stream.write_all(request.as_bytes()).ok()?;
+    read_response(stream)
+}
 
+/// HTTPレスポンス全体を読み切ってボディだけを返す。
+/// ストリームは `crate::transport::Stream`(TCP/Unix 双方)を受け付ける。
+fn read_response<S: Read + Write>(stream: &mut S) -> Option<String> {
     // ヘッダ境界 "\r\n\r\n" まで読み進める。
     let sep = b"\r\n\r\n";
     let mut buf = Vec::new();
@@ -69,12 +76,11 @@ pub fn get_body(host: &str, port: u16, path: &str) -> Option<String> {
 /// Transfer-Encoding: chunked が指定されているか(大文字小文字無視)。
 fn is_chunked(header: &str) -> bool {
     for line in header.lines() {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("transfer-encoding")
-                && v.to_ascii_lowercase().contains("chunked")
-            {
-                return true;
-            }
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("transfer-encoding")
+            && v.to_ascii_lowercase().contains("chunked")
+        {
+            return true;
         }
     }
     false
@@ -85,11 +91,7 @@ fn is_chunked(header: &str) -> bool {
 fn decode_chunked(mut data: &[u8]) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(data.len());
     let crlf = b"\r\n";
-    loop {
-        let line_end = match find_subslice(data, crlf) {
-            Some(p) => p,
-            None => break,
-        };
+    while let Some(line_end) = find_subslice(data, crlf) {
         // チャンクサイズ行(拡張子 ";..." は無視する)。
         let size_str = String::from_utf8_lossy(&data[..line_end]);
         let size_hex = size_str.split(';').next().unwrap_or("").trim();
@@ -116,10 +118,10 @@ fn decode_chunked(mut data: &[u8]) -> String {
 /// レスポンスヘッダから Content-Length を取り出す(大文字小文字無視)。
 fn content_length(header: &str) -> Option<usize> {
     for line in header.lines() {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                return v.trim().parse::<usize>().ok();
-            }
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-length")
+        {
+            return v.trim().parse::<usize>().ok();
         }
     }
     None

@@ -15,6 +15,9 @@ pub struct ChannelEntry {
     pub channel: String,
     pub name: String,
     pub service_id: Option<u64>,
+    /// このチャンネルで X-Mirakc-Tuner に指定するチューナー名。
+    /// API 応答に `tuner` フィールドがあればそれを使う(無ければ空 → 設定値)。
+    pub tuner: String,
 }
 
 /// チャンネル一覧と、そこから導出したチューニング空間情報。
@@ -47,12 +50,17 @@ impl Channels {
             "/api/channels"
         };
 
-        let body = match http::get_body(&cfg.server_host, cfg.port_num(), path) {
+        let body = match get_body(cfg, path) {
             Some(b) => b,
             None => return Channels::default(),
         };
 
-        let value: Value = match serde_json::from_str(&body) {
+        Channels::from_json(&body, cfg.service_split == 1)
+    }
+
+    /// JSON 文字列からチャンネル一覧を構築する(API 取得とテストで共用)。
+    pub fn from_json(body: &str, service_split: bool) -> Channels {
+        let value: Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(_) => return Channels::default(),
         };
@@ -64,13 +72,16 @@ impl Channels {
 
         let mut entries = Vec::with_capacity(array.len());
         for item in array {
-            let entry = if cfg.service_split == 1 {
+            let entry = if service_split {
                 let ch = &item["channel"];
                 ChannelEntry {
                     type_: ch["type"].as_str().unwrap_or("").to_string(),
                     channel: ch["channel"].as_str().unwrap_or("").to_string(),
                     name: item["name"].as_str().unwrap_or("").to_string(),
-                    service_id: item["serviceId"].as_u64(),
+                    // SERVICE_SPLIT=1 のストリーム URL は Mirakurun のサービス id
+                    // (NID*100000+SID)を使う。BonDriver_mirakc と同じ。
+                    service_id: item["id"].as_u64(),
+                    tuner: ch["tuner"].as_str().unwrap_or("").to_string(),
                 }
             } else {
                 ChannelEntry {
@@ -78,6 +89,7 @@ impl Channels {
                     channel: item["channel"].as_str().unwrap_or("").to_string(),
                     name: item["name"].as_str().unwrap_or("").to_string(),
                     service_id: None,
+                    tuner: item["tuner"].as_str().unwrap_or("").to_string(),
                 }
             };
             entries.push(entry);
@@ -128,6 +140,14 @@ impl Channels {
             Some(idx)
         }
     }
+}
+
+/// 設定に応じたトランスポートで API を GET し、ボディを返す。
+/// SERVER_TYPE="unix" なら Unix ドメインソケット、それ以外は TCP。
+fn get_body(cfg: &Config, path: &str) -> Option<String> {
+    let mut stream = crate::transport::connect(cfg)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    http::get_via(&mut stream, &cfg.server_host, path, cfg.priority)
 }
 
 /// フラットなチャンネル列を type ごとにグループ化し、

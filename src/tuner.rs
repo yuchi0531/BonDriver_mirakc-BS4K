@@ -1,33 +1,31 @@
 //! チューナ本体(元実装の CBonTuner 相当)。
 //!
-//! TVTest から呼ばれる各APIの実体。チャンネル選局時に Mirakurun の stream API へ
-//! HTTP GET を発行し、バックグラウンドスレッドでTSデータを受信してキューに積む。
+//! TVTest/EDCB から呼ばれる各APIの実体。チャンネル選局時に Mirakurun/mirakc の
+//! stream API へ HTTP GET を発行し、バックグラウンドスレッドでTS(TLV)データを
+//! 受信してキューに積む。
 //!
 //! 元実装は Push/Pop の2スレッド + オーバーラップドI/O だったが、ここでは
 //! 1本の受信スレッド + Mutex/Condvar のキューという等価でより素直な構成にしている。
+//!
+//! 通信路は TCP と Unix ドメインソケット(`SERVER_TYPE=unix`)の両方に対応する。
 
 use std::collections::VecDeque;
+use std::ffi::c_void;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::config::Config;
+use crate::transport::{self, Stream};
 use crate::util::{
-    to_wide, ASYNCBUFFSIZE, BITRATE_CALC_TIME_MS, FALSE, TRUE, TSDATASIZE, TUNER_NAME,
-    WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ASYNCBUFFSIZE, BITRATE_CALC_TIME_MS, BITRATE_MAX_MBPS, FALSE, TRUE, TSDATASIZE, TUNER_NAME,
+    USER_AGENT, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT, to_wide,
 };
-use crate::{with_channels, CONFIG};
+use crate::{CONFIG, with_channels};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::System::Threading::{
-    CreateMutexW, OpenMutexW, ReleaseMutex,
-};
-
-const MUTEX_ALL_ACCESS: u32 = 0x001F_0001;
-
-/// 受信スレッドとTVTest側スレッドで共有する状態。
+/// 受信スレッドとホスト側スレッドで共有する状態。
 struct Shared {
     queue: Mutex<VecDeque<Vec<u8>>>,
     cond: Condvar,
@@ -39,8 +37,8 @@ struct Shared {
 struct StreamCtx {
     shared: Arc<Shared>,
     handle: Option<JoinHandle<()>>,
-    /// 受信スレッドの read をブロック解除するための複製ソケット。
-    shutdown: TcpStream,
+    /// 受信スレッドの read をブロック解除するための複製ストリーム。
+    shutdown: Stream,
 }
 
 /// チューナの状態。
@@ -57,14 +55,14 @@ pub struct Tuner {
     /// チューナ名のワイド文字列。
     name_wide: Vec<u16>,
 
-    /// 多重オープン検出用の名前付きミューテックス。
-    mutex_handle: HANDLE,
+    /// 多重オープン検出用の名前付きミューテックス(Windows のみ)。
+    mutex_handle: *mut c_void,
 
     bitrate: f32,
     last_calc: Instant,
 }
 
-// HANDLE(生ポインタ)を含むが、Tuner は TVTest 側スレッドからのみ操作され、
+// 生ポインタ(HANDLE)を含むが、Tuner はホスト側スレッドからのみ操作され、
 // 受信スレッドへ渡すのは Arc<Shared> のみであるため安全に扱える。
 unsafe impl Send for Tuner {}
 
@@ -100,7 +98,7 @@ impl Tuner {
         // ストリーム停止。
         if let Some(mut ctx) = self.stream.take() {
             ctx.shared.running.store(false, Ordering::SeqCst);
-            let _ = ctx.shutdown.shutdown(Shutdown::Both);
+            ctx.shutdown.shutdown_both();
             ctx.shared.cond.notify_all();
             if let Some(h) = ctx.handle.take() {
                 let _ = h.join();
@@ -112,13 +110,8 @@ impl Tuner {
         self.cur_channel = 0xFFFF_FFFF;
 
         // ミューテックス開放。
-        if !self.mutex_handle.is_null() {
-            unsafe {
-                ReleaseMutex(self.mutex_handle);
-                CloseHandle(self.mutex_handle);
-            }
-            self.mutex_handle = std::ptr::null_mut();
-        }
+        destroy_sole_instance(self.mutex_handle);
+        self.mutex_handle = std::ptr::null_mut();
 
         self.bitrate = 0.0;
     }
@@ -220,12 +213,7 @@ impl Tuner {
     }
 
     /// GetTsStream(コピー版)。
-    pub fn get_ts_stream_copy(
-        &mut self,
-        pdst: *mut u8,
-        psize: *mut u32,
-        premain: *mut u32,
-    ) -> i32 {
+    pub fn get_ts_stream_copy(&mut self, pdst: *mut u8, psize: *mut u32, premain: *mut u32) -> i32 {
         let mut src: *mut u8 = std::ptr::null_mut();
         let ret = self.get_ts_stream_ptr(&mut src, psize, premain);
         if ret == TRUE {
@@ -252,16 +240,7 @@ impl Tuner {
     }
 
     pub fn is_tuner_opening(&self) -> i32 {
-        let name = to_wide(TUNER_NAME);
-        let handle = unsafe { OpenMutexW(MUTEX_ALL_ACCESS, 0, name.as_ptr()) };
-        if !handle.is_null() {
-            unsafe {
-                CloseHandle(handle);
-            }
-            TRUE
-        } else {
-            FALSE
-        }
+        is_sole_instance(self.open)
     }
 
     pub fn enum_tuning_space(&mut self, space: u32) -> *const u16 {
@@ -299,12 +278,14 @@ impl Tuner {
         // 一旦クローズ。
         self.close_tuner();
 
-        // 接続先URLとリクエストを構築する。
+        // 接続先URLを構築する(BonDriver_mirakc と同じエンドポイント)。
+        //   SERVICE_SPLIT=0: /api/channels/{type}/{channel}/stream
+        //   SERVICE_SPLIT=1: /api/services/{id}/stream
         let path = if cfg.service_split == 1 {
-            let sid = entry.service_id.unwrap_or(0);
             format!(
-                "/api/channels/{}/{}/services/{}/stream?decode={}",
-                entry.type_, entry.channel, sid, cfg.decode_b25
+                "/api/services/{}/stream?decode={}",
+                entry.service_id.unwrap_or(0),
+                cfg.decode_b25
             )
         } else {
             format!(
@@ -312,52 +293,55 @@ impl Tuner {
                 entry.type_, entry.channel, cfg.decode_b25
             )
         };
-        let request = format!(
-            "GET {} HTTP/1.0\r\nX-Mirakurun-Priority: {}\r\n\r\n",
-            path, cfg.priority
-        );
 
-        // 接続。
-        let mut stream = match TcpStream::connect((cfg.server_host.as_str(), cfg.port_num())) {
-            Ok(s) => s,
-            Err(_) => return FALSE,
+        // X-Mirakc-Tuner は channel stream のみで有効。エントリにチューナー名が
+        // 無ければ設定値(GLOBAL.TUNER)を使う。BS4K 等でチューナーを厳密に
+        // 固定したい場合に利用する(mirakc-BS4K 独自機能)。
+        let tuner = if entry.tuner.is_empty() {
+            cfg.tuner.as_str()
+        } else {
+            entry.tuner.as_str()
         };
-        let _ = stream.set_nodelay(true);
+        let tuner_header = sanitize_header_value(tuner)
+            .map(|t| format!("X-Mirakc-Tuner: {t}\r\n"))
+            .unwrap_or_default();
 
-        if stream.write_all(request.as_bytes()).is_err() {
-            return FALSE;
+        // 接続〜ストリーム確立。BonDriver_mirakc 同様、非 200 の場合は 500ms
+        // 空けて 1 回だけ再試行する(多重オープン/チューナー競合対策)。
+        let mut established = None;
+        for attempt in 0..2 {
+            match open_stream(cfg, &path, &tuner_header) {
+                Ok(ctx) => {
+                    established = Some(ctx);
+                    break;
+                }
+                Err(code) => {
+                    if attempt == 0 {
+                        std::thread::sleep(Duration::from_millis(500));
+                    } else {
+                        // ストリームは得られなかったが、BonDriver_mirakc と同様に
+                        // 選局は完了扱いにする(GetReadyCount=0 のまま)。
+                        eprintln!(
+                            "BonDriver_Mirakurun: stream unavailable (status {:?}) for {}",
+                            code, path
+                        );
+                        self.cur_space = space;
+                        self.cur_channel = channel;
+                        return TRUE;
+                    }
+                }
+            }
         }
 
-        // ブロック解除用の複製ソケット。
-        let shutdown = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => return FALSE,
-        };
-
-        // 受信スレッド起動。
-        let shared = Arc::new(Shared {
-            queue: Mutex::new(VecDeque::new()),
-            cond: Condvar::new(),
-            recv_bytes: AtomicU64::new(0),
-            running: AtomicBool::new(true),
-        });
-        let shared_thread = Arc::clone(&shared);
-        let handle = std::thread::spawn(move || reader_loop(stream, shared_thread));
-
-        self.stream = Some(StreamCtx {
-            shared,
-            handle: Some(handle),
-            shutdown,
-        });
-
-        // 多重オープン検出用ミューテックス作成。
-        let name = to_wide(TUNER_NAME);
-        self.mutex_handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
+        // 多重オープン検出用ミューテックス作成(Windows のみ)。
+        self.mutex_handle = create_sole_instance();
 
         // チャンネル情報更新。
         self.cur_space = space;
         self.cur_channel = channel;
 
+        // 受信セッションを設定してからキューを空にする。
+        self.stream = established;
         self.purge_ts_stream();
         TRUE
     }
@@ -379,9 +363,10 @@ impl Tuner {
                 Some(ctx) => ctx.shared.recv_bytes.swap(0, Ordering::SeqCst),
                 None => 0,
             };
-            // Mbps 換算。
-            self.bitrate =
-                ((bytes as f64 * 8.0 * 1000.0) / (span as f64 * 1024.0 * 1024.0)) as f32;
+            // Mbps 換算。TLV/TS いずれもバイト量ベースで算出する。
+            let mbps = ((bytes as f64 * 8.0 * 1000.0) / (span as f64 * 1024.0 * 1024.0)) as f32;
+            // BonDriver_mirakc と同様に 100Mbps で頭打ちにする。
+            self.bitrate = mbps.min(BITRATE_MAX_MBPS);
             self.last_calc = Instant::now();
         }
     }
@@ -393,51 +378,191 @@ impl Drop for Tuner {
     }
 }
 
-/// 受信スレッド本体。ソケットからTSデータを読み続けてキューへ積む。
-/// ストリーム先頭のHTTPレスポンスヘッダはTSデータに混入させず読み飛ばす。
-fn reader_loop(mut stream: TcpStream, shared: Arc<Shared>) {
+/// キューへ1チャンク積む(上限超過時は古いものから捨てる)。
+fn enqueue(shared: &Shared, chunk: Vec<u8>) {
+    if chunk.is_empty() {
+        return;
+    }
+    shared
+        .recv_bytes
+        .fetch_add(chunk.len() as u64, Ordering::SeqCst);
+    let mut guard = shared.queue.lock().unwrap();
+    while guard.len() >= ASYNCBUFFSIZE {
+        guard.pop_front();
+    }
+    guard.push_back(chunk);
+    drop(guard);
+    shared.cond.notify_one();
+}
+
+/// ストリーム接続を確立して受信スレッドを起動する。
+///
+/// レスポンスのステータス行・ヘッダをここで読み切ってボディ先頭の残りを
+/// 取り出し、受信スレッドへ渡す(BonDriver_mirakc の WinHTTP 相当)。
+/// 非 200 の場合や接続失敗の場合は `Err(Some(status))` / `Err(None)` を返す。
+fn open_stream(cfg: &Config, path: &str, tuner_header: &str) -> Result<StreamCtx, Option<u16>> {
+    let mut stream = transport::connect(cfg).ok_or(None)?;
+    stream.set_nodelay(true);
+
+    let request = format!(
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: {ua}\r\nX-Mirakurun-Priority: {pri}\r\n{tuner}Connection: close\r\n\r\n",
+        host = cfg.server_host,
+        ua = USER_AGENT,
+        pri = cfg.priority,
+        tuner = tuner_header,
+    );
+    stream.write_all(request.as_bytes()).map_err(|_| None)?;
+
+    // ステータス確認 + ヘッダ読み飛ばし。
+    let leftover = read_stream_header(&mut stream)?;
+
+    // ブロック解除用の複製。
+    let shutdown = stream.try_clone().map_err(|_| None)?;
+
+    let shared = Arc::new(Shared {
+        queue: Mutex::new(VecDeque::new()),
+        cond: Condvar::new(),
+        recv_bytes: AtomicU64::new(0),
+        running: AtomicBool::new(true),
+    });
+    let shared_thread = Arc::clone(&shared);
+    let handle = std::thread::spawn(move || reader_loop(stream, shared_thread, leftover));
+
+    Ok(StreamCtx {
+        shared,
+        handle: Some(handle),
+        shutdown,
+    })
+}
+
+/// レスポンスのステータス行+ヘッダを読み、200 以外なら Err(Some(status))。
+/// 200 ならヘッダ以降の残りボディを返す。
+fn read_stream_header(stream: &mut Stream) -> Result<Vec<u8>, Option<u16>> {
     /// ヘッダとして受け付ける最大サイズ。超えたら異常応答とみなす。
     const MAX_HEADER_SIZE: usize = 64 * 1024;
 
-    let mut buf = vec![0u8; TSDATASIZE];
     let mut header = Vec::new();
-    let mut in_header = true;
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(pos) = crate::http::find_subslice(&header, b"\r\n\r\n") {
+            break pos;
+        }
+        if header.len() > MAX_HEADER_SIZE {
+            return Err(None);
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err(None), // ヘッダ完結前に切断
+            Ok(n) => header.extend_from_slice(&chunk[..n]),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(_) => return Err(None),
+        }
+    };
+
+    let status = parse_status_code(&header[..header_end]).ok_or(None)?;
+    if status != 200 {
+        return Err(Some(status));
+    }
+    Ok(header[header_end + 4..].to_vec())
+}
+
+/// "HTTP/1.1 200 OK" のステータスコードを取り出す。
+pub(crate) fn parse_status_code(head: &[u8]) -> Option<u16> {
+    let line_end = head
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(head.len());
+    let line = std::str::from_utf8(&head[..line_end]).ok()?;
+    line.split_whitespace().nth(1)?.parse::<u16>().ok()
+}
+
+/// ヘッダ値として安全な文字列のみを返す(CR/LF 等の注入を除去)。
+pub(crate) fn sanitize_header_value(v: &str) -> Option<String> {
+    let t = v.trim();
+    if t.is_empty() || t.chars().any(|c| c == '\r' || c == '\n' || c == '\0') {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// 受信スレッド本体。ストリームからデータを読み続けてキューへ積む。
+///
+/// ステータス行・ヘッダは `read_stream_header` で読み飛ばし済みで、`leftover`
+/// にボディ先頭の残りが入っている。BS4K(MMT/TLV)の場合は 188byte TS ではなく
+/// TLV パケットが流れてくるが、内容に依存せずバイト列のまま中継する。
+fn reader_loop(mut stream: Stream, shared: Arc<Shared>, leftover: Vec<u8>) {
+    if !leftover.is_empty() {
+        enqueue(&shared, leftover);
+    }
+
+    let mut buf = vec![0u8; TSDATASIZE];
     while shared.running.load(Ordering::SeqCst) {
         match stream.read(&mut buf) {
             Ok(0) => break, // 切断
-            Ok(n) => {
-                let chunk: Vec<u8> = if in_header {
-                    header.extend_from_slice(&buf[..n]);
-                    match crate::http::find_subslice(&header, b"\r\n\r\n") {
-                        Some(pos) => {
-                            in_header = false;
-                            let body = header[pos + 4..].to_vec();
-                            header = Vec::new();
-                            if body.is_empty() {
-                                continue;
-                            }
-                            body
-                        }
-                        None if header.len() > MAX_HEADER_SIZE => break,
-                        None => continue, // まだヘッダの途中
-                    }
-                } else {
-                    buf[..n].to_vec()
-                };
-                shared.recv_bytes.fetch_add(chunk.len() as u64, Ordering::SeqCst);
-                let mut guard = shared.queue.lock().unwrap();
-                // バッファ上限を超えたら古いものから捨てる。
-                while guard.len() >= ASYNCBUFFSIZE {
-                    guard.pop_front();
-                }
-                guard.push_back(chunk);
-                drop(guard);
-                shared.cond.notify_one();
-            }
+            Ok(n) => enqueue(&shared, buf[..n].to_vec()),
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(_) => break,
         }
     }
     shared.running.store(false, Ordering::SeqCst);
     shared.cond.notify_all();
+}
+
+// ---- 多重オープン検出 --------------------------------------------------
+
+/// 名前付きミューテックスを作成して保持する(Windows)。
+#[cfg(windows)]
+fn create_sole_instance() -> *mut c_void {
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let name = to_wide(TUNER_NAME);
+    unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) as *mut c_void }
+}
+
+#[cfg(not(windows))]
+fn create_sole_instance() -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// 名前付きミューテックスを開放する(Windows)。
+#[cfg(windows)]
+fn destroy_sole_instance(handle: *mut c_void) {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::ReleaseMutex;
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        let h = handle as HANDLE;
+        ReleaseMutex(h);
+        CloseHandle(h);
+    }
+}
+
+#[cfg(not(windows))]
+fn destroy_sole_instance(_handle: *mut c_void) {}
+
+/// 既にチューナーが開かれているか。
+///
+/// Windows では元実装同様、名前付きミューテックスの存在で判定する。
+/// Linux 等では名前付きミューテックスが無いため、自身の open 状態を返す。
+#[cfg(windows)]
+fn is_sole_instance(_open: bool) -> i32 {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::OpenMutexW;
+    const MUTEX_ALL_ACCESS: u32 = 0x001F_0001;
+
+    let name = to_wide(TUNER_NAME);
+    let handle = unsafe { OpenMutexW(MUTEX_ALL_ACCESS, 0, name.as_ptr()) };
+    if !handle.is_null() {
+        unsafe {
+            CloseHandle(handle);
+        }
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+#[cfg(not(windows))]
+fn is_sole_instance(open: bool) -> i32 {
+    if open { TRUE } else { FALSE }
 }

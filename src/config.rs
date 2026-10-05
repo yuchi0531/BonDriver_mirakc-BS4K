@@ -12,15 +12,43 @@ use std::path::Path;
 pub struct Config {
     pub server_host: String,
     pub server_port: String,
+    /// "http" または "unix"。Linux では Unix ドメインソケットを使用できる。
+    pub server_type: String,
+    /// SERVER_TYPE="unix" のときのソケットパス。
+    pub server_sockpath: String,
     pub decode_b25: i32,
     pub priority: i32,
     pub service_split: i32,
+    /// X-Mirakc-Tuner ヘッダで固定するチューナー名(mirakc-BS4K 独自機能)。
+    /// 空なら従来どおりルート選択に任せる。
+    pub tuner: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            server_host: "localhost".to_string(),
+            // BonDriver_mirakc(mirakc 推奨ドライバ)の既定ポートに合わせる。
+            server_port: "40772".to_string(),
+            server_type: "http".to_string(),
+            server_sockpath: String::new(),
+            decode_b25: 0,
+            priority: 0,
+            service_split: 0,
+            tuner: String::new(),
+        }
+    }
 }
 
 impl Config {
-    /// 接続に使用するポート番号。パースできない場合は 8888 を返す。
+    /// 接続に使用するポート番号。パースできない場合は 40772 を返す。
     pub fn port_num(&self) -> u16 {
-        self.server_port.parse::<u16>().unwrap_or(8888)
+        self.server_port.parse::<u16>().unwrap_or(40772)
+    }
+
+    /// Unix ドメインソケットを使うか(SERVER_TYPE="unix")。
+    pub fn use_unix_socket(&self) -> bool {
+        self.server_type.eq_ignore_ascii_case("unix") && !self.server_sockpath.is_empty()
     }
 
     /// INIファイルを読み込んで Config を生成する。
@@ -29,15 +57,22 @@ impl Config {
         let text = std::fs::read(ini_path).ok()?;
         // INIはASCII想定。非ASCIIはロッシーに変換する。
         let text = String::from_utf8_lossy(&text);
-        let ini = Ini::parse(&text);
+        Some(Config::parse(&text))
+    }
 
-        Some(Config {
+    /// テキストから Config を生成する(INI未検出時の既定値にも使用)。
+    pub fn parse(text: &str) -> Config {
+        let ini = Ini::parse(text);
+        Config {
             server_host: ini.get_string("GLOBAL", "SERVER_HOST", "localhost"),
-            server_port: ini.get_string("GLOBAL", "SERVER_PORT", "8888"),
+            server_port: ini.get_string("GLOBAL", "SERVER_PORT", "40772"),
+            server_type: ini.get_string("GLOBAL", "SERVER_TYPE", "http"),
+            server_sockpath: ini.get_string("GLOBAL", "SERVER_SOCKPATH", ""),
             decode_b25: ini.get_int("GLOBAL", "DECODE_B25", 0),
             priority: ini.get_int("GLOBAL", "PRIORITY", 0),
             service_split: ini.get_int("GLOBAL", "SERVICE_SPLIT", 0),
-        })
+            tuner: ini.get_string("GLOBAL", "TUNER", ""),
+        }
     }
 }
 

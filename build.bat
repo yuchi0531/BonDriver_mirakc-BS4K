@@ -1,9 +1,9 @@
 @echo off
 rem ====================================================================
-rem  BonDriver_Mirakurun build script
+rem  BonDriver_Mirakurun build script (Windows)
 rem
 rem  Usage:
-rem    build.bat              build with the default target
+rem    build.bat              build with the default target (MSVC)
 rem    build.bat <target>     build with the given Rust target
 rem
 rem  Default target: x86_64-pc-windows-msvc (MSVC).
