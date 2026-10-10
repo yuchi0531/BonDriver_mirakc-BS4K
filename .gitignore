@@ -2,3 +2,6 @@
 target/
 dist/
 Cargo.lock
+
+# Release packaging output (zip artifacts)
+release/

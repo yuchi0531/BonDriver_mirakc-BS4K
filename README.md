@@ -5,8 +5,13 @@
 
 本リポジトリはオリジナルの C++ 実装を **Rust に全面移植** したもので、
 **Windows(TVTest 等)と Linux(EDCB の Unix 版)の両方**で動作します。
-単一のコードベースから `x86_64-pc-windows-msvc` / `x86_64-pc-windows-gnu` /
-`x86_64-unknown-linux-gnu` をビルドできます。
+単一のコードベースから次のターゲットをビルドできます。
+
+| ターゲット | 生成物 | 主な用途 |
+| --- | --- | --- |
+| `x86_64-pc-windows-msvc` | `BonDriver_Mirakurun.dll` | TVTest (64bit) |
+| `i686-pc-windows-msvc` | `BonDriver_Mirakurun.dll` | TVTest (32bit) |
+| `x86_64-unknown-linux-gnu` | `BonDriver_Mirakurun.so` | EDCB (Linux) |
 
 対応する独自機能:
 
@@ -18,9 +23,9 @@
 ## 必要環境
 
 - [rustup](https://rustup.rs/)(ツールチェーン管理)
-- 対応アーキテクチャは **x64** のみ
-  - Windows x86(32bit)はメンバ関数が `__thiscall` 規約になるため未対応です
-    (`src/lib.rs` で `compile_error!` によりビルドを禁止しています)。
+- 対応アーキテクチャ: Windows **x64 / x86(32bit)**、Linux **x64**
+  - Windows x86 ではメンバ関数が `__thiscall`(this を ECX で渡す)規約に
+    なるため、vtable スロットを `extern "thiscall"` で構築しています。
 
 ### Windows
 
@@ -56,6 +61,12 @@ build.bat
 
 - 既定ターゲットは `x86_64-pc-windows-msvc`(MSVC)です。
 - 生成物は `dist\BonDriver_Mirakurun.dll` と `dist\BonDriver_Mirakurun.ini` に出力されます。
+- 32bit 版が必要な場合は引数で渡せます:
+
+```bat
+build.bat i686-pc-windows-msvc
+```
+
 - 別ターゲットを指定する場合は引数で渡せます。LLVM-MinGW 環境なら:
 
 ```bat
@@ -79,6 +90,30 @@ build.bat x86_64-pc-windows-gnu
 cargo build --release
 cp target/release/libBonDriver_Mirakurun.so dist/BonDriver_Mirakurun.so
 ```
+
+### 3ターゲット一括ビルド(リリース zip)
+
+`release.sh` を使うと、win-x86_64 / win-x86 / linux-x86_64 をまとめて
+ビルドし、配布用 zip を `release/` に出力します。
+
+```sh
+./release.sh            # バージョンは Cargo.toml から取得
+./release.sh 2.2.0      # バージョン明示
+```
+
+出力:
+
+```
+release/BonDriver_Mirakurun-<ver>-win-x86_64.zip   (DLL + ini)
+release/BonDriver_Mirakurun-<ver>-win-x86.zip      (DLL + ini)
+release/BonDriver_Mirakurun-<ver>-linux-x86_64.zip (so + so.ini)
+```
+
+- Windows ターゲットのクロスコンパイルには `cargo-xwin` が必要です:
+  `cargo install cargo-xwin`
+- cargo-xwin 同梱の lld-link は `/export:...,EXPORTAS,...` を解釈できないため、
+  `release.sh` は rustup 同梱の新しい `lld-link`(rust-lld)を使うラッパを
+  自動生成します。別のリンカを使う場合は `LLD_LINK=/path/to/lld-link ./release.sh`。
 
 ## インストール
 
@@ -168,11 +203,15 @@ mirakc(mirakc-BS4K)は `GET /api/channels/{type}/{channel}/stream` に対して
 
 ## 実装メモ
 
-- **ABI(Windows)**: `CreateBonDriver` は MSVC が実際に生成する vtable スロット順
-  (同名オーバーロードの逆順配置、`IBonDriver2` で再宣言される `Release` の
-  基底スロット共有を含む全17スロット)に一致させています。TVTest(LibISDB)は
-  `dynamic_cast<IBonDriver2*>` を実行するため、MSVC 互換の RTTI 構造体を
-  実行時に構築し vtable に付加しています(`src/rtti.rs`)。
+- **ABI(Windows x64/x86)**: `CreateBonDriver` は MSVC が実際に生成する vtable
+  スロット順(同名オーバーロードの逆順配置、`IBonDriver2` で再宣言される
+  `Release` の基底スロット共有を含む全17スロット)に一致させています。
+  - x86(32bit)ではメンバ関数が `__thiscall`(this を ECX、スタックは呼ばれた側が
+    掃除)のため、vtable スロットを `extern "thiscall"` で構築しています。
+  - TVTest(LibISDB)は `dynamic_cast<IBonDriver2*>` を実行するため、MSVC 互換の
+    RTTI 構造体を実行時に構築し vtable に付加しています(`src/rtti.rs`)。
+    x64 は image-relative 参照(COL 24byte)、x86 は絶対アドレス参照
+    (COL 20byte)で構築します。
 - **ABI(Linux)**: ホスト(EDCB)は `CreateBonStruct`(コンパイラ非依存の C 互換
   構造体)を優先して使うため、Linux では `dynamic_cast` 不要です。本実装は
   `CreateBonStruct` と `CreateBonDriver`(Itanium の宣言順 vtable)の両方を

@@ -1,8 +1,8 @@
 [package]
 name = "bondriver_mirakurun"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
-description = "BonDriver for Mirakurun/mirakc (Rust, Windows + Linux)"
+description = "BonDriver for Mirakurun/mirakc (Rust, Windows x86/x64 + Linux x64)"
 license = "MIT"
 
 # 出力名を固定する。
