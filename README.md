@@ -194,6 +194,12 @@ mirakc(mirakc-BS4K)は `GET /api/channels/{type}/{channel}/stream` に対して
 
 - 固定したい場合は INI の `TUNER` に `config.tuners[].name` と同じ文字列を設定します。
   設定すると、channel stream 取得時に自動でヘッダが付与されます。
+- **対応放送種別による絞り込み**: チューナーを固定すると、`/api/tuners` を参照して
+  そのチューナーが対応する放送種別(`types`。GR/BS/CS/SKY/BS4K/CATV)だけを
+  チャンネル一覧に表示します。衛星専用チューナーを指定したときに地上波が、
+  地上波専用チューナーを指定したときに衛星が一覧に出て選局時に HTTP 404 に
+  なる問題を防ぎます。`/api/tuners` が取得できない場合や `types` が空の場合は
+  絞り込まず全波を表示します(従来動作)。
 - API の `/api/channels` 応答に `tuner` フィールドがある場合は、そちらが
   チャンネル単位で優先されます。
 - このヘッダは **channel stream(GET)** でのみ有効です。`/api/services/{id}/stream`

@@ -55,11 +55,20 @@ impl Channels {
             None => return Channels::default(),
         };
 
-        Channels::from_json(&body, cfg.service_split == 1)
+        // チューナー固定時(GLOBAL.TUNER)は、そのチューナーが対応する放送種別
+        // のみを一覧に残す。衛星専用チューナーに地上波が、地上波専用チューナーに
+        // 衛星が表示されて選局時に 404 になる問題を防ぐ。
+        let allowed = tuner_channel_types(cfg);
+        Channels::from_json_filtered(&body, cfg.service_split == 1, allowed.as_deref())
     }
 
-    /// JSON 文字列からチャンネル一覧を構築する(API 取得とテストで共用)。
-    pub fn from_json(body: &str, service_split: bool) -> Channels {
+    /// JSON 文字列からチャンネル一覧を構築する。`allowed_types` が Some の場合は
+    /// その種別に一致するチャンネルのみを残す(チューナー固定時の絞り込み)。
+    pub fn from_json_filtered(
+        body: &str,
+        service_split: bool,
+        allowed_types: Option<&[String]>,
+    ) -> Channels {
         let value: Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(_) => return Channels::default(),
@@ -92,6 +101,13 @@ impl Channels {
                     tuner: item["tuner"].as_str().unwrap_or("").to_string(),
                 }
             };
+            // チューナー固定時は対応種別のみ残す(大文字小文字は無視)。
+            if let Some(allowed) = allowed_types {
+                let t = entry.type_.to_ascii_uppercase();
+                if !allowed.iter().any(|a| a.eq_ignore_ascii_case(&t)) {
+                    continue;
+                }
+            }
             entries.push(entry);
         }
 
@@ -148,6 +164,50 @@ fn get_body(cfg: &Config, path: &str) -> Option<String> {
     let mut stream = crate::transport::connect(cfg)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     http::get_via(&mut stream, &cfg.server_host, path, cfg.priority)
+}
+
+/// 固定チューナー(GLOBAL.TUNER)が対応する放送種別を `/api/tuners` から取得する。
+///
+/// 戻り値:
+/// - `Some(types)`: チューナーが見つかり、対応種別で絞り込む。
+/// - `None`: チューナー未指定、または `/api/tuners` 取得/解析失敗。
+///   この場合は絞り込みを行わない(従来動作を維持し、全波を表示)。
+fn tuner_channel_types(cfg: &Config) -> Option<Vec<String>> {
+    if cfg.tuner.is_empty() {
+        return None;
+    }
+    let body = get_body(cfg, "/api/tuners")?;
+    let types = tuner_types_from_json(&body, &cfg.tuner)?;
+    // 対応種別が空(取得できず)の場合は絞り込まない(全波を維持)。
+    if types.is_empty() { None } else { Some(types) }
+}
+
+/// `/api/tuners` の JSON から、指定チューナー名の対応種別を取り出す。
+///
+/// 応答は Mirakurun 互換のチューナー配列で、各要素は `name` と `types`
+/// (GR/BS/CS/SKY/BS4K/CATV)を持つ。1件だけの応答(オブジェクト)にも対応する。
+pub fn tuner_types_from_json(body: &str, name: &str) -> Option<Vec<String>> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    // 通常は配列。単一オブジェクトで返すサーバにも一応対応する。
+    let tuners: Vec<&Value> = match &value {
+        Value::Array(a) => a.iter().collect(),
+        Value::Object(_) => vec![&value],
+        _ => return None,
+    };
+    for tuner in tuners {
+        if tuner["name"].as_str() == Some(name) {
+            let types: Vec<String> = tuner["types"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Some(types);
+        }
+    }
+    None
 }
 
 /// フラットなチャンネル列を type ごとにグループ化し、

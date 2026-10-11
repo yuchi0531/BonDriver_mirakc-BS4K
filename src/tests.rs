@@ -74,7 +74,7 @@ fn channels_parse_and_spaces() {
         {"type":"BS4K","channel":"45328","name":"BS4K-test","services":[]},
         {"type":"BS4K","channel":"0xB110","name":"BS4K-two","services":[]}
     ]"#;
-    let ch = Channels::from_json(json, false);
+    let ch = Channels::from_json_filtered(json, false, None);
     assert_eq!(ch.enum_tuning_space(0), Some("GR"));
     assert_eq!(ch.enum_tuning_space(1), Some("BS"));
     assert_eq!(ch.enum_tuning_space(2), Some("BS4K"));
@@ -104,7 +104,7 @@ fn channels_service_split_uses_channel_object() {
         {"id":300101,"serviceId":101,"name":"4K-svc",
          "channel":{"type":"BS4K","channel":"45328"}}
     ]"#;
-    let ch = Channels::from_json(json, true);
+    let ch = Channels::from_json_filtered(json, true, None);
     assert_eq!(ch.enum_tuning_space(0), Some("BS4K"));
     let e = ch.entry(0, 0).unwrap();
     assert_eq!(e.name, "4K-svc");
@@ -117,15 +117,96 @@ fn channels_per_channel_tuner_is_parsed() {
     let json = r#"[
         {"type":"BS4K","channel":"45328","name":"4K","tuner":"tuner1","services":[]}
     ]"#;
-    let ch = Channels::from_json(json, false);
+    let ch = Channels::from_json_filtered(json, false, None);
     assert_eq!(ch.entry(0, 0).unwrap().tuner, "tuner1");
 }
 
 #[test]
 fn channels_invalid_json_is_empty() {
-    let ch = Channels::from_json("not json", false);
+    let ch = Channels::from_json_filtered("not json", false, None);
     assert!(ch.is_empty());
     assert_eq!(ch.enum_tuning_space(0), None);
+}
+
+#[test]
+fn tuner_types_from_api_response() {
+    // mirakc の /api/tuners 応答。チューナー名 -> 対応種別。
+    let json = r#"[
+        {"index":0,"name":"sat","types":["BS","CS","SKY","BS4K"]},
+        {"index":1,"name":"gr","types":["GR"]},
+        {"index":2,"name":"catv","types":["CATV"]}
+    ]"#;
+    assert_eq!(
+        crate::channels::tuner_types_from_json(json, "sat"),
+        Some(vec![
+            "BS".to_string(),
+            "CS".to_string(),
+            "SKY".to_string(),
+            "BS4K".to_string()
+        ])
+    );
+    assert_eq!(
+        crate::channels::tuner_types_from_json(json, "gr"),
+        Some(vec!["GR".to_string()])
+    );
+    // 存在しないチューナー名は None。
+    assert_eq!(crate::channels::tuner_types_from_json(json, "nope"), None);
+}
+
+#[test]
+fn channel_filter_by_tuner_types_satellite_only() {
+    // 衛星専用チューナー(BS/CS/SKY/BS4K)を固定した場合、地上波(GR)は出ない。
+    let json = r#"[
+        {"type":"GR","channel":"27","name":"TOKYO MX","services":[]},
+        {"type":"BS","channel":"BS01","name":"BS1","services":[]},
+        {"type":"BS4K","channel":"45328","name":"BS4K-test","services":[]}
+    ]"#;
+    let allowed = vec![
+        "BS".to_string(),
+        "CS".to_string(),
+        "SKY".to_string(),
+        "BS4K".to_string(),
+    ];
+    let ch = Channels::from_json_filtered(json, false, Some(&allowed));
+    // GR 空間は消え、BS / BS4K のみ。
+    assert_eq!(ch.enum_tuning_space(0), Some("BS"));
+    assert_eq!(ch.enum_tuning_space(1), Some("BS4K"));
+    assert_eq!(ch.enum_tuning_space(2), None);
+    // space0=BS の先頭は BS1。
+    assert_eq!(ch.enum_channel_name(0, 0), Some("BS1"));
+}
+
+#[test]
+fn channel_filter_by_tuner_types_ground_only() {
+    // 地上波専用チューナー(GR)を固定した場合、衛星は出ない。
+    let json = r#"[
+        {"type":"GR","channel":"27","name":"TOKYO MX","services":[]},
+        {"type":"BS","channel":"BS01","name":"BS1","services":[]}
+    ]"#;
+    let allowed = vec!["GR".to_string()];
+    let ch = Channels::from_json_filtered(json, false, Some(&allowed));
+    assert_eq!(ch.enum_tuning_space(0), Some("GR"));
+    assert_eq!(ch.enum_tuning_space(1), None);
+}
+
+#[test]
+fn channel_filter_is_case_insensitive() {
+    // 種別の大小文字差を吸収する(設定は小文字でも可)。
+    let json = r#"[{"type":"BS","channel":"BS01","name":"BS1","services":[]}]"#;
+    let allowed = vec!["bs".to_string()];
+    let ch = Channels::from_json_filtered(json, false, Some(&allowed));
+    assert_eq!(ch.enum_tuning_space(0), Some("BS"));
+}
+
+#[test]
+fn no_filter_keeps_all_types() {
+    let json = r#"[
+        {"type":"GR","channel":"27","name":"TOKYO MX","services":[]},
+        {"type":"BS","channel":"BS01","name":"BS1","services":[]}
+    ]"#;
+    let ch = Channels::from_json_filtered(json, false, None);
+    assert_eq!(ch.enum_tuning_space(0), Some("GR"));
+    assert_eq!(ch.enum_tuning_space(1), Some("BS"));
 }
 
 #[test]
